@@ -19,6 +19,7 @@ import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.*;
@@ -33,15 +34,19 @@ public class EntityFieldScannerMojo extends AbstractMojo {
     @Parameter(defaultValue = "${project.basedir}/src/main/resources/reflection")
     private File resourcesDirectory;
 
+    @Parameter(defaultValue = "${project.basedir}/src/main/resources/META-INF/native-image")
+    private File nativeImageDirectory;
+
     private static final String ENTITY_SUPERCLASS = "Entity";
     private static final String RES_SUPERCLASS = "Res";
     private Map<String, Set<String>> classHierarchy;
     private File reflectionFile;
+    private File reflectConfigFile;
     private FilePojo.FilePojoBuilder filePojoBuilder = FilePojo.builder();
     private final HashMap<String, String> entityClassNameToFullName = new HashMap<>();
     private final HashMap<String, String> revEntityClassNameToFullName = new HashMap<>();
-
     private final HashMap<String, Set<DiePojo>> entityToDies = new HashMap<>();
+    private final List<Map<String, Object>> reflectionData = new ArrayList<>();
 
     @Override
     public void execute() throws MojoExecutionException {
@@ -49,13 +54,16 @@ public class EntityFieldScannerMojo extends AbstractMojo {
             if (!resourcesDirectory.exists()) {
                 resourcesDirectory.mkdirs();
             }
-            reflectionFile = Arrays.stream(resourcesDirectory.listFiles((dir, name) -> name.endsWith(".json"))).findFirst().orElseGet(() -> new File(resourcesDirectory + "/reflection.json"));
-            if (!reflectionFile.exists())
-                reflectionFile.createNewFile();
-            if (reflectionFile == null) {
-                getLog().info("No reflection files found or created");
-                return;
+            if (!nativeImageDirectory.exists()) {
+                nativeImageDirectory.mkdirs();
             }
+
+            reflectionFile = new File(resourcesDirectory, "reflection.json");
+            reflectConfigFile = new File(nativeImageDirectory, "reflect-config.json");
+
+            if (!reflectionFile.exists()) reflectionFile.createNewFile();
+            if (!reflectConfigFile.exists()) reflectConfigFile.createNewFile();
+
             SourceRoot sourceRoot = new SourceRoot(Paths.get(sourceDirectory.toURI()));
             classHierarchy = new HashMap<>();
 
@@ -63,10 +71,9 @@ public class EntityFieldScannerMojo extends AbstractMojo {
 
             for (ParseResult<CompilationUnit> parseResult : compilationUnits) {
                 Optional<CompilationUnit> result = parseResult.getResult();
-                result.ifPresent(compilationUnit -> {
-                    compilationUnit.accept(new ClassVisitor(), classHierarchy);
-                });
+                result.ifPresent(compilationUnit -> compilationUnit.accept(new ClassVisitor(), classHierarchy));
             }
+
             for (ParseResult<CompilationUnit> parseResult : compilationUnits) {
                 Optional<CompilationUnit> result = parseResult.getResult();
                 result.ifPresent(compilationUnit -> {
@@ -80,28 +87,23 @@ public class EntityFieldScannerMojo extends AbstractMojo {
             }
 
             FilePojo filePojo = filePojoBuilder.build();
-            filePojo.getEntities()
-                    .forEach(entity -> {
-                                entity.getFields()
-                                        .forEach(field -> {
-                                            // Get generics safely, default to an empty list if null
-                                            List<String> generics = field.getGeneric();
-                                            if (generics != null) {
-                                                // Replace each string in `genaric` with its mapped value
-                                                List<String> updatedGenerics = generics.stream()
-                                                        .map(entityClassNameToFullName::get)
-                                                        .toList();
-                                                // Set the updated list back to the field
-                                                generics.clear();
-                                                generics.addAll(updatedGenerics);
-                                            }
-                                        });
-                                entity.setDies(entityToDies.get(revEntityClassNameToFullName
-                                        .get(entity.getName())));
+            filePojo.getEntities().forEach(entity -> {
+                entity.getFields().forEach(field -> {
+                    List<String> generics = field.getGeneric();
+                    if (generics != null) {
+                        List<String> updatedGenerics = generics.stream()
+                                .map(entityClassNameToFullName::get)
+                                .toList();
+                        generics.clear();
+                        generics.addAll(updatedGenerics);
+                    }
+                });
+                entity.setDies(entityToDies.get(revEntityClassNameToFullName.get(entity.getName())));
+            });
 
-                            }
-                    );
             filePojo.write(reflectionFile);
+//            writeReflectionFile(reflectConfigFile);
+            getLog().info("Reflection metadata generated: " + reflectConfigFile.getAbsolutePath());
 
         } catch (IOException e) {
             throw new MojoExecutionException("Error parsing source files", e);
@@ -112,10 +114,11 @@ public class EntityFieldScannerMojo extends AbstractMojo {
         getLog().info("Found class: " + classDeclaration.getNameAsString());
         if (isAncestor(classDeclaration.getNameAsString(), ENTITY_SUPERCLASS, classHierarchy)) {
             getLog().info("Found entity: " + classDeclaration.getFullyQualifiedName().orElse(""));
-            String className = classDeclaration.getNameAsString();
-            String fullClassName = classDeclaration.getFullyQualifiedName().orElse(className);
-            entityClassNameToFullName.put(className, fullClassName);
-            revEntityClassNameToFullName.put(fullClassName, className);
+
+            String fullClassName = classDeclaration.getFullyQualifiedName().orElse(classDeclaration.getNameAsString());
+            entityClassNameToFullName.put(classDeclaration.getNameAsString(), fullClassName);
+            revEntityClassNameToFullName.put(fullClassName, classDeclaration.getNameAsString());
+
             EntityPojo.EntityPojoBuilder builder = EntityPojo.builder().name(fullClassName);
 
             classDeclaration.findAll(FieldDeclaration.class).forEach(field -> {
@@ -148,6 +151,18 @@ public class EntityFieldScannerMojo extends AbstractMojo {
                     }
                 }
             });
+
+            Map<String, Object> classMetadata = new HashMap<>();
+            classMetadata.put("name", fullClassName);
+            classMetadata.put("allDeclaredFields", true);
+            classMetadata.put("allDeclaredMethods", true);
+            classMetadata.put("allDeclaredConstructors", true);
+            classMetadata.put("annotations", classDeclaration.getAnnotations().stream()
+                    .map(annotationExpr -> "\"" + annotationExpr.getNameAsString() + "\"")
+                    .collect(Collectors.toList()));
+
+            reflectionData.add(classMetadata);
+
             return builder.build();
         }
         return null;
@@ -159,29 +174,43 @@ public class EntityFieldScannerMojo extends AbstractMojo {
             super.visit(cid, classHierarchy);
             String className = cid.getNameAsString();
             Set<String> supers = classHierarchy.computeIfAbsent(className, k -> new HashSet<>());
-            cid.getExtendedTypes().forEach(extendedType -> {
-                String superClassName = extendedType.getNameAsString();
-                supers.add(superClassName);
-            });
-            cid.getImplementedTypes().forEach(implementedType -> {
-                String interfaceName = implementedType.getNameAsString();
-                supers.add(interfaceName);
-            });
+            cid.getExtendedTypes().forEach(extendedType -> supers.add(extendedType.getNameAsString()));
+            cid.getImplementedTypes().forEach(implementedType -> supers.add(implementedType.getNameAsString()));
         }
     }
 
     private boolean isAncestor(String className, String potentialAncestor, Map<String, Set<String>> classHierarchy) {
         if (classHierarchy.containsKey(className)) {
             Set<String> superClasses = classHierarchy.get(className);
+            if (superClasses.contains(potentialAncestor)) {
+                return true;
+            }
             for (String superClass : superClasses) {
-                if (superClass.equals(potentialAncestor)) {
+                if (isAncestor(superClass, potentialAncestor, classHierarchy)) {
                     return true;
                 }
             }
-            for (String superClass : superClasses) {
-                return isAncestor(superClass, potentialAncestor, classHierarchy);
-            }
         }
         return false;
+    }
+
+    private void writeReflectionFile(File file) throws IOException {
+        try (FileWriter writer = new FileWriter(file)) {
+            writer.write("[\n");
+            for (int i = 0; i < reflectionData.size(); i++) {
+                writer.write("  " + toJson(reflectionData.get(i)));
+                if (i < reflectionData.size() - 1) writer.write(",");
+                writer.write("\n");
+            }
+            writer.write("]");
+        }
+    }
+
+    private String toJson(Map<String, Object> map) {
+        return map.entrySet().stream()
+                .map(entry -> "    \"" + entry.getKey() + "\": " + (entry.getValue() instanceof String
+                        ? "\"" + entry.getValue() + "\""
+                        : entry.getValue()))
+                .collect(Collectors.joining(",\n", "{\n", "\n  }"));
     }
 }
